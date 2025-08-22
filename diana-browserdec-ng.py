@@ -5,8 +5,9 @@ Copyright 2025, Tijl "Photubias" Deneut <@tijldeneut>
 Copyright 2025, Banaanhangwagen <@banaanhangwagen>
 This script provides offline decryption of Chromium based browser user data: Google Chrome, Edge Chromium and Opera
 
-Update 2025-05: clean-up code 
+Update 2025-05: clean-up code
 Update 2025-06: make it compatible with AppBoundEncryption
+Update 2025-08: code clean-up and minor updates
 '''
 
 import argparse
@@ -24,7 +25,7 @@ from termcolor import colored
 DPAPI_PREFIX = b'\x01\x00\x00\x00'
 APPBOUND_PREFIX = b'\x76\x32\x30'
 
-# Static keys for certain Chrome ABE key PBE derivations - see https://github.com/runassu/chrome_v20_decryption
+# Static keys for third stage app_bound_encryption-key derivation - see https://github.com/runassu/chrome_v20_decryption
 aes_key = bytes.fromhex("B31C6E241AC846728DA9C1FAC4936651CFFB944D143AB816276BCC6DA0284787")
 chacha20_key = bytes.fromhex("E98F37D7F4E1FA433D19304DC2258042090E2D1D7EEA7670D41F738D08729660")
 
@@ -44,27 +45,31 @@ def parse_local_state(local_state_file, verbose=True):
         with open(local_state_file, "r") as file:
             local_state = json.load(file)
 
-            encrypted_key_b64 = local_state.get("os_crypt", {}).get("encrypted_key")
+            os_crypt = local_state.get("os_crypt", {})
+            encrypted_key_b64 = os_crypt.get("encrypted_key")
+
             if not encrypted_key_b64:
                 sys.exit(colored(f"[-] Error: 'os_crypt.encrypted_key' not found in \"{local_state_file}\".", "red"))
+
             encrypted_key = base64.b64decode(encrypted_key_b64)[5:]     # The first 5 bytes "DPAPI" are removed to get the actual DPAPI-blob
             local_state_blob = blob.DPAPIBlob(encrypted_key)
 
-            if 'app_bound_encrypted_key' in local_state['os_crypt']:
-                bABESystemData = base64.b64decode(local_state['os_crypt']['app_bound_encrypted_key']).strip(b'\x00')
+            if 'app_bound_encrypted_key' in os_crypt:
+                bABESystemData = base64.b64decode(os_crypt['app_bound_encrypted_key']).strip(b'\x00')
                 if bABESystemData.startswith(b'APPB'):                  # Check for custom 'APPB'-prefix before the actual DPAPI blob
                     oABESystemBlob = blob.DPAPIBlob(bABESystemData[4:])
                     print(colored(f"[INFO] Parsing Local State.", "yellow"))
                     if verbose:
                         print(f"    [+] Found encrypted_key: {encrypted_key[:32].hex():>97}...")
-                        print(f"    [+] encrypted_key uses user-masterkey (GUID): {local_state_blob.mkguid:>48}")
+                        print(f"    [+] encrypted_key uses User-masterkey-GUID: {local_state_blob.mkguid:>50}")
                         print(f"    [+] Found app_bound_encrypted_key: {bABESystemData[:32].hex():>87}...")
-                        print(f"    [+] app_bound_encrypted_key uses system-masterkey (GUID): {oABESystemBlob.mkguid:>30}")
+                        print(f"    [+] app_bound_encrypted_key uses System-masterkey-GUID: {oABESystemBlob.mkguid:>32}")
+
             if 'variations_permanent_consistency_country' in local_state:
                 Version = local_state['variations_permanent_consistency_country'][0]
-                if Version: print(f'    [+] Detected Browser version: {Version:>41}')
+                if Version: print(f'    [+] Detected Browser version: {Version:>42}')
 
-        return blob.DPAPIBlob(encrypted_key), oABESystemBlob, Version
+        return local_state_blob, oABESystemBlob, Version
     except Exception as e:
         sys.exit(colored(f"[-] Error reading or processing \"Local State\"-file '{local_state_file}': {e}", 'red'))
 
@@ -76,7 +81,10 @@ def parse_login_file(filepath, guid_list):
         with sqlite3.connect(filepath) as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT origin_url, username_value, password_value, id FROM logins')
-        for url, user, pwd_blob, login_id in cursor.fetchall():
+            rows = cursor.fetchall()
+            if not rows:
+                print(colored("[INFO] No credentials found in Login Data.", "yellow"))
+        for url, user, pwd_blob, login_id in rows:
             if pwd_blob and pwd_blob.startswith(DPAPI_PREFIX):  # Check if password blob exists and is DPAPI encrypted
                 parsed_blob = blob.DPAPIBlob(pwd_blob)
                 if parsed_blob.mkguid not in guid_list:
@@ -110,13 +118,12 @@ def decrypt_bme(parsed_blob, masterkey):
     try:
         if parsed_blob.decrypt(masterkey):
             return parsed_blob.cleartext
-    except:
-        pass
+    except Exception as e:
+        print(colored(f"[-] Failed to decrypt blob with masterkey: {e}", "red"))
     return None
 
 
 def decryptChromeString(encrypted_data, bme_key, abe_key=None, masterkeys=None, verbose=False):
-
     if not encrypted_data:
         return None
 
@@ -163,22 +170,26 @@ def decryptChromeString(encrypted_data, bme_key, abe_key=None, masterkeys=None, 
 
 def decryptLogins(items, bme_key, abe_key=None, masterkeys=None, csvfile=None, verbose=False, label='Credential'):
     count = 0
+
     if csvfile:
         file_path = f'{label.lower()}_{csvfile}'
         with open(file_path, 'a') as f:
             if label == 'Credential':
                 f.write("ID;Version;URL;Username;Password\n")
+
             for item in items:
                 encrypted_data = decryptChromeString(item[2], bme_key, abe_key, masterkeys, verbose)
-                # if verbose:
+
                 print('ID:        {}'.format(item[3]))
                 print('Version:   {}'.format(item[2][:3].decode('ascii')))
                 print('URL:       {}'.format(item[0]))
                 print('User Name: {}'.format(item[1]))
                 print('Password:  {}'.format(encrypted_data))
                 print('*' * 50)
+
                 if encrypted_data is not None:
                     count += 1
+
                 if label == 'Credential':
                     f.write(f"{item[3]};{item[2][:3].decode('ascii')};{item[0]};{item[1]};{encrypted_data}\n")
                 else:
@@ -186,7 +197,7 @@ def decryptLogins(items, bme_key, abe_key=None, masterkeys=None, csvfile=None, v
     else:
         for item in items:
             encrypted_data = decryptChromeString(item[2], bme_key, abe_key, masterkeys, verbose)
-            # if verbose:
+
             print('ID:        {}'.format(item[3]))
             print('Version:   {}'.format(item[2][:3].decode('ascii')))
             print('URL:       {}'.format(item[0]))
@@ -217,6 +228,95 @@ def decryptNotes(notes, bme_key, abe_key=None, masterkeys=None, guid_list=None, 
     return count
 
 
+def load_masterkeys_from_file(filepath):
+    with open(filepath) as f:
+        return [bytes.fromhex(line.strip()) for line in f if len(line.strip()) in (40, 128)]
+
+
+def process_system_registry(args, abe_system_blob):
+    abe_user_blob = None
+
+    try:
+        if args.verbose:
+            print(f'    [+] Found SYSTEM & SECURITY, trying first-stage app_bound_encrypted_key decryption using SYSTEM')
+
+        oReg = registry.Regedit()
+        oSecrets = oReg.get_lsa_secrets(args.security, args.system)
+        bDPAPI_SYSTEM = oSecrets.get('DPAPI_SYSTEM')['CurrVal']
+
+        if not bDPAPI_SYSTEM:
+            print(colored(f"[-] Failed to extract DPAPI_SYSTEM key.","red"))
+            return None
+
+        else:
+            if args.verbose:
+                print(f"        [+] Successfully extracted DPAPI_SYSTEM key from registry: {bDPAPI_SYSTEM.hex()}")
+
+        oMKP1 = masterkey.MasterKeyPool()
+        oMKP1.loadDirectory(args.systemmasterkey)
+        oMKP1.addSystemCredential(bDPAPI_SYSTEM)
+
+        if oMKP1.try_credential_hash(None, None) > 0:  # Decrypt system MKs
+            if args.verbose:
+                print(f'    [+] Loaded {len(oMKP1.keys)} potential system masterkey(s) from SystemMasterKey-folder')
+            for lstMKL_system in oMKP1.keys.values():
+                for oMK_system in lstMKL_system:
+                    if oMK_system.decrypted:
+                        system_mk_bytes = oMK_system.get_key()
+
+                        # Now, try to decrypt the abe_system_blob with this system_mk
+                        if args.verbose:
+                            print(colored(f"            [*] Trying system masterkey \"{oMK_system.guid.decode()}\" to decrypt app_bound_encrypted_key","magenta"))
+
+                        bABEUserData_payload = decrypt_bme(abe_system_blob, system_mk_bytes)
+                        if bABEUserData_payload:
+                            abe_user_blob = blob.DPAPIBlob(bABEUserData_payload)  # This is the second-stage blob
+                            if args.verbose:
+                                print(colored(f"    [+] Successfully decrypted app_bound_encrypted_key using System Masterkey \"{oMK_system.guid.decode()}\"."))
+                                print(colored(f"    [+] This second app_bound_encrypted_key now requires User Masterkey \"{abe_user_blob.mkguid}\" for third-stage app_bound_encrypted_key."))
+                            return abe_user_blob
+            if not abe_user_blob:
+                print(colored("    [-] Failed to decrypt any System Masterkeys using DPAPI_SYSTEM LSA key.", "red"))
+
+        if not abe_user_blob and args.verbose:
+            print(colored("    [-] Could not decrypt app_bound_encrypted_key. Did you point to the correct System Masterkey-folder?","red"))
+
+    except Exception as e:
+        print(colored(f"    [-] Error during app_bound_encrypted_key decryption: {e}", "red"))
+
+    return abe_user_blob
+
+
+def decrypt_with_static_keys(abe_key, verbose=False):
+    if abe_key[0:5] == b'\x1f\x00\x00\x00\x02' and b"Chrome" in abe_key:
+        if verbose:
+            print(f'    [+] Trying to decrypt app_bound_encrypted_key with known static keys')
+
+        bFlag = abe_key[-61:-60]
+        iv = abe_key[-60:-48]
+        bCiphertext = abe_key[-48:-16]
+        tag = abe_key[-16:]
+
+        if bFlag == b'\x01':
+            if verbose:
+                print(f'       [!] Found flag "{bFlag.hex()}". Using AES-GCM with static key...')
+            cipher = AES.new(aes_key, AES.MODE_GCM, nonce=iv)
+        elif bFlag == b'\x02':
+            if verbose:
+                print(f'        [!] Found flag "{bFlag.hex()}". Using ChaCha20-Poly1305 with static key...')
+            cipher = ChaCha20_Poly1305.new(key=chacha20_key, nonce=iv)
+        else:
+            print(colored(f'Unknown flag "{bFlag.hex()}"', 'red'))
+            return abe_key[-32:]
+
+        try:
+            return cipher.decrypt_and_verify(bCiphertext, tag)
+        except ValueError:
+            pass
+
+    return abe_key[-32:]
+
+
 def process_masterkeys(args, local_state_blob, abe_system_blob=None):
     masterkeys = []
     masterkey_blob = None
@@ -231,8 +331,7 @@ def process_masterkeys(args, local_state_blob, abe_system_blob=None):
     # Option 1b: List of masterkeys
     elif args.masterkeylist:
         print(f'[!] Trying list of masterkeys from file: {args.masterkeylist}')
-        with open(args.masterkeylist) as f:
-            masterkeys = [bytes.fromhex(line.strip()) for line in f if len(line.strip()) in (40, 128)]
+        masterkeys = load_masterkeys_from_file(args.masterkeylist)
 
     # Prepare MasterKeyPool if mkfile is provided (for user or system keys)
     if args.mkfile:
@@ -242,55 +341,11 @@ def process_masterkeys(args, local_state_blob, abe_system_blob=None):
         else:
             mkp.loadDirectory(args.mkfile)
             if args.verbose:
-                print(f'    [+] Loaded {len(mkp.keys)} potential user-masterkey(s) from folder: {args.mkfile}')
+                print(f'    [+] Loaded {len(mkp.keys)} potential user-masterkey(s) from UserMasterKey-folder')
 
-    # SYSTEM registry handling
-    system_mks_for_abe = []
     abe_user_blob = None
     if args.system and args.security and args.systemmasterkey and abe_system_blob:
-        try:
-            if args.verbose:
-                print(f'    [+] Found SYSTEM & SECURITY, trying first-stage app_bound_encrypted_key decryption using SYSTEM')
-            oReg = registry.Regedit()
-            oSecrets = oReg.get_lsa_secrets(args.security, args.system)
-            bDPAPI_SYSTEM = oSecrets.get('DPAPI_SYSTEM')['CurrVal']
-            if not bDPAPI_SYSTEM:
-                print(colored(f"[-] Failed to extract DPAPI_SYSTEM key.","red"))
-            else:
-                if args.verbose:
-                    print(f"        [+] Successfully extracted DPAPI_SYSTEM key from registry: {bDPAPI_SYSTEM.hex()}")
-            oMKP1 = masterkey.MasterKeyPool()
-            oMKP1.loadDirectory(args.systemmasterkey)
-            oMKP1.addSystemCredential(bDPAPI_SYSTEM)
-
-            if oMKP1.try_credential_hash(None, None) > 0:  # Decrypt system MKs
-                if args.verbose:
-                    print(f'    [+] Loaded {len(oMKP1.keys)} potential system masterkey(s) from folder: {args.systemmasterkey}')
-                    print(f"        [+] Successfully decrypted {len(oMKP1.keys)} system masterkey(s).")
-                for lstMKL_system in oMKP1.keys.values():
-                    for oMK_system in lstMKL_system:
-                        if oMK_system.decrypted:
-                            system_mk_bytes = oMK_system.get_key()
-                            system_mks_for_abe.append(system_mk_bytes)
-                            # Now, try to decrypt the abe_system_blob with this system_mk
-                            if args.verbose: print(colored(f"            [*] Trying system masterkey \"{oMK_system.guid.decode()}\" to decrypt app_bound_encrypted_key","magenta"))
-
-                            bABEUserData_payload = decrypt_bme(abe_system_blob, system_mk_bytes)
-                            if bABEUserData_payload:
-                                abe_user_blob = blob.DPAPIBlob(bABEUserData_payload)  # This is the second-stage blob
-                                if args.verbose:
-                                    print(colored(f"        [+] Successfully decrypted app_bound_encrypted_key using system masterkey \"{oMK_system.guid.decode()}\"."))
-                                    print(colored(f"        [+] This second app_bound_encrypted_key now requires user masterkey \"{abe_user_blob.mkguid}\" for third-stage ABE-key."))
-                                break  # Found a system key that works for abe_system_blob
-                    if abe_user_blob: break
-                else:
-                    print(colored("    [-] Failed to decrypt any system masterkeys using DPAPI_SYSTEM LSA key.", "red"))
-            if not abe_user_blob and args.verbose:
-                print(colored("    [-] Could not decrypt the ABE System Blob. Final ABE key derivation might fail.","yellow"))
-
-        except Exception as e:
-            print(colored(f"    [-] Error during ABE System Blob decryption: {e}", "red"))
-
+        abe_user_blob = process_system_registry(args, abe_system_blob)
 
     # Option 2: PVK domain key
     if mkp and args.pvk:
@@ -306,12 +361,13 @@ def process_masterkeys(args, local_state_blob, abe_system_blob=None):
                         print(colored('[+] Success, user Masterkey decrypted: ' + masterkey_blob.hex(), 'green'))
                     if abe_user_blob and mk_guid.decode(errors='ignore') == abe_user_blob.mkguid:
                         abe_masterkey = mk.get_key()
-                        print(colored(f'[+] Success, ABE masterkey decrypted: {abe_masterkey.hex()}', 'green'))
+                        print(colored(f'[+] Success, app_bound_encrypted_key decrypted: {abe_masterkey.hex()}', 'green'))
 
     # Option 3: User SID + password
     if args.mkfile and args.sid and (args.password or args.pwdhash):
         if args.verbose:
-            print(f'    [+] Trying decryption of user-masterkey with user-SID and password...')
+            print(f'    [+] Trying decryption of User Masterkey with user-SID and provided password...')
+
         if args.password:
             mkp.try_credential(args.sid, args.password)
         else:
@@ -325,10 +381,27 @@ def process_masterkeys(args, local_state_blob, abe_system_blob=None):
                 if mk_guid.decode(errors='ignore') == local_state_blob.mkguid:
                     masterkey_blob = mk.get_key()
                     if args.verbose:
-                        print(colored(f'        [+] Successfully decrypted the user-masterKey'))
+                        print(colored(f'        [+] Successfully decrypted the User Masterkey'))
                     # print(colored(f'            [+] {masterkey_blob.hex()}', 'cyan'))
 
     return masterkey_blob, masterkeys, mkp, abe_masterkey, abe_user_blob
+
+
+def validate_paths(args):
+    checks = [
+        (args.statefile, 'Local State file', os.path.isfile),
+        (args.loginfile, 'Login Data file', os.path.isfile),
+        (args.masterkeylist, 'Masterkey list file', os.path.isfile),
+        (args.system, 'SYSTEM hive file', os.path.isfile),
+        (args.security, 'SECURITY hive file', os.path.isfile),
+        (args.pvk, 'PVK file', os.path.isfile),
+        (args.systemmasterkey, 'System Masterkey folder', os.path.isdir),
+        (args.mkfile, 'User Masterkey folder', os.path.isdir),
+    ]
+
+    for path, desc, check_func in checks:
+        if path and not check_func(path):
+            sys.exit(colored(f"[-] Error: {desc} not found: {path}", "red"))
 
 
 if __name__ == '__main__':
@@ -341,7 +414,7 @@ if __name__ == '__main__':
     parser.add_argument('-f', '--masterkeylist', metavar="", help='File containing Masterkeys')
     parser.add_argument('-m', '--mkfile', metavar="",
                         default=os.path.join('%AppData%', 'Microsoft', 'Protect', 'S-1-5-21-...'),
-                        help='Masterkey GUID file or directory')
+                        help='User Masterkey folder')
     parser.add_argument('-s', '--sid', metavar="", help='User SID')
     parser.add_argument('-a', '--pwdhash', metavar="", help='SHA1 password hash')
     parser.add_argument('-p', '--password', metavar="", help='User password')
@@ -372,32 +445,13 @@ if __name__ == '__main__':
         print(f"{' Cookies:':<14} {'%localappdata%\\{Google/Microsoft}\\{Chrome/Edge}\\User Data\\Default\\Network\\Cookies':<60}")
         print(f"{' Masterkey(s):':<14} {'%appdata%\\Microsoft\\Protect\\S-1-5-21...-folder':<60}")
 
-    required_files = [
-        (args.statefile, 'Local State'),
-        (args.loginfile, 'Login Data'),
-        (args.masterkeylist, 'Masterkey list'),
-        # (args.mkfile, 'GUID file'),
-        (args.system, 'SYSTEM hive'),
-        (args.security, 'SECURITY hive'),
-        (args.pvk, 'PVK file')
-    ]
-    required_folders = [
-        (args.systemmasterkey, 'Systemmasterkey folder'),
-        (args.mkfile, 'Masterkey folder')
-    ]
-
-    for filepath, desc in required_files:
-        if filepath and not os.path.isfile(filepath):
-            sys.exit(colored(f"[-] Error: \"{desc}\"-file not found: {filepath}", "red"))
-
-    for folder_path, description in required_folders:
-        if not os.path.isdir(folder_path):
-            sys.exit(colored(f"[-] Error: \"{description}\" not found: {folder_path}", "red"))
+    validate_paths(args)
 
     if args.mkfile:
         args.mkfile = args.mkfile.replace('*', '')
         if not os.path.exists(args.mkfile):
             sys.exit(colored(f"[-] Error: mkfile not found: {args.mkfile}", "red"))
+
         if not args.sid:
             match = re.search(r"S-1-\d+-\d+-\d+-\d+-\d+-\d+", args.mkfile)
             if match:
@@ -445,10 +499,8 @@ if __name__ == '__main__':
 
     print(colored('[INFO] Extracting Browser Master Encryption and App-Bound Encryption key from \"Local State\"', 'yellow'))
 
-
     # Process masterkeys based on provided arguments
-    masterkey_blob, masterkeys_list, mkp, abe_masterkey, abe_user_blob = process_masterkeys(args, local_state_blob,
-                                                                                            abe_system_blob)
+    masterkey_blob, masterkeys_list, mkp, abe_masterkey, abe_user_blob = process_masterkeys(args, local_state_blob, abe_system_blob)
     masterkeys = masterkeys_list
 
     # Try to get Browser Master Encryption key
@@ -463,7 +515,7 @@ if __name__ == '__main__':
             masterkeys.append(masterkey_blob)
 
     if bme_key:
-        print(colored(f'    [+] Successfully got Browser Master Encryption key: {bme_key.hex()}', 'green'))
+        print(colored(f'    [+] Successfully got Browser Master Encryption key: {bme_key.hex()}'))
     else:
         print(
             colored(f'[-] Error decrypting Browser Master Encryption key. Is the (correct) password provided?', 'red'))
@@ -480,33 +532,8 @@ if __name__ == '__main__':
             abe_key = decrypt_bme(abe_user_blob, abe_masterkey)
 
         if abe_key:
-            if abe_key[0:5] == b'\x1f\x00\x00\x00\x02' and "Chrome" in abe_key.decode(errors="ignore"):
-                if args.verbose:
-                    print(f'    [+] Trying to decrypt ABE-key with known static keys')
-
-                bFlag = abe_key[-61:-60]
-                iv = abe_key[-60:-48]
-                bCiphertext = abe_key[-48:-16]
-                tag = abe_key[-16:]
-
-                if bFlag == b'\x01':
-                    if args.verbose:
-                        print(f'       [!] Found flag \"{bFlag.hex()}\". Using AES-GCM with static key.')
-                    cipher = AES.new(aes_key, AES.MODE_GCM, nonce=iv)
-                elif bFlag == b'\x02':
-                    if args.verbose:
-                        print(f'        [!] Found flag \"{bFlag.hex()}\". Using ChaCha20-Poly1305 with static key.')
-                    cipher = ChaCha20_Poly1305.new(key=chacha20_key, nonce=iv)
-                else:
-                    print(colored(f'Unknown flag \"{bFlag.hex()}\"', 'red'))
-
-                try:
-                    abe_key = cipher.decrypt_and_verify(bCiphertext, tag)
-                    print(colored(f'    [+] Success! Final App-Bound Encryption-key: {abe_key.hex()}', 'green'))
-                except ValueError:
-                    pass
-            else:
-                abe_key = abe_key[-32:]
+            abe_key = decrypt_with_static_keys(abe_key, args.verbose)
+            print(colored(f'    [+] Success! Final app_bound_encrypted_key: {abe_key.hex()}', 'green'))
 
     ## Decrypt
     if args.loginfile:
