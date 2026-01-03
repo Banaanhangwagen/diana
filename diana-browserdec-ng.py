@@ -1,15 +1,16 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 r'''
-Copyright 2025, Tijl "Photubias" Deneut <@tijldeneut>
-Copyright 2025, Banaanhangwagen <@banaanhangwagen>
+Copyright 2026, Tijl "Photubias" Deneut <@tijldeneut>
+Copyright 2026, Banaanhangwagen <@banaanhangwagen>
+GNU GENERAL PUBLIC LICENSE - Version 3
 This script provides offline decryption of Chromium based browser user data: Google Chrome, Edge Chromium and Opera
 
 Update 2025-05: clean-up code
 Update 2025-06: make it compatible with AppBoundEncryption
 Update 2025-08: code clean-up and minor updates
 Update 2025-11: code refactoring and adding flag "v3"
-Update 2025-12: code refactoring
+Update 2026-01: code refactoring + adding CNG-key for v3 decryption
 '''
 import argparse
 import os
@@ -50,7 +51,6 @@ EMPTY_PASSWORD_HASH = 'da39a3ee5e6b4b0d3255bfef95601890afd80709'
 # ============================================================================
 # FILE PARSING
 # ============================================================================
-
 def hexdump(data, width=16):
     lines = []
     for i in range(0, len(data), width):
@@ -65,9 +65,11 @@ def load_json_file(filepath):
     with open(filepath, "r") as f:
         return json.load(f)
 
+
 def decode_base64_key(key_b64, prefix_len=5):   # Skip "DPAPI" prefix
     return base64.b64decode(key_b64)[prefix_len:]
 
+    
 def parse_local_state(filepath, verbose=True):
     """Extract encrypted_key/app_bound_encrypted_key and browser-version from Local State file."""
     try:
@@ -166,7 +168,6 @@ def parse_deleted_logins(filepath):
 # ============================================================================
 # MASTERKEY OPERATIONS
 # ============================================================================
-
 def extract_dpapi_system_key(system_hive, security_hive, verbose=False):
     """Extract DPAPI_SYSTEM key from registry hives."""
     try:
@@ -174,7 +175,8 @@ def extract_dpapi_system_key(system_hive, security_hive, verbose=False):
         secrets = reg.get_lsa_secrets(security_hive, system_hive)
         dpapi_system = secrets.get('DPAPI_SYSTEM', {}).get('CurrVal')
         if dpapi_system and verbose:
-            print(f"    [+] Stage 0 - DPAPI_SYSTEM key from registry: \n{hexdump(dpapi_system)}")
+            print(colored(f"    [+] Stage 0 - Extracted DPAPI_SYSTEM key from registry:", "cyan"))
+            print(colored(f"{hexdump(dpapi_system)}",))
         return dpapi_system
 
     except Exception as e:
@@ -317,10 +319,10 @@ def decrypt_browser_master_encryption_key(local_state_blob, masterkeys, verbose=
 
 def decrypt_abe_stage1_with_system_key(abe_system_blob, system_masterkeys, verbose=False):
     """
-    Stage 1: Decrypt app_bound_encrypted_key using system masterkeys.
+    Stage 1: Decrypt app_bound_encrypted_key using SystemMasterkey.
     """
     if verbose:
-        print('    [+] Stage 1 - Decrypting app_bound_encrypted_key with SystemMasterkey')
+        print(colored('    [+] Stage 1 - Decrypting app_bound_encrypted_key with SystemMasterkey', "cyan"))
 
     for guid, system_mk in system_masterkeys:
         if verbose:
@@ -341,22 +343,205 @@ def decrypt_abe_stage2_with_user_key(abe_user_blob, masterkeys, verbose=False):
     Stage 2: Decrypt abe_user_blob using new UserMasterkey.
     """
     if verbose:
-        print(colored(f'    [+] Stage 2 - Decrypting new app_bound_blob with new UserMasterkey', ))
+        print(colored(f'    [+] Stage 2 - Decrypting new app_bound_blob with UserMasterkey', "cyan"))
 
     for mk in masterkeys:
         abe_encrypted_key = decrypt_dpapi_blob(abe_user_blob, mk)
         if abe_encrypted_key:
             if verbose:
-                print(colored(f'    [+] Stage 2 - Success!', ))
-                print(colored(f'    [+] Stage 2 - Got encrypted_ABE-key: \n{hexdump(abe_encrypted_key)}', ))
+                print(colored(f'         [+] Success!', ))
+                print(colored(f'         [+] Got encrypted_ABE-key: \n{hexdump(abe_encrypted_key)}', ))
             return abe_encrypted_key
     return None
 
 
-def decrypt_abe_stage3_with_static_keys(abe_encrypted_key, verbose=False):
+def extract_cng_key_from_directory(dirpath, args, verbose=False):
     """
-    Stage 3: Decrypt app_bound_encrypted_key using known static keys.
+    Implements extraction of new CNG-key:
+    - Scan directory for UTF16 'Google Chromekey1'
+    - Locate DPAPI block pair
+    - Decrypt second block using dpapick with SYSTEM master keys
+    - Validate KDBM header
+    - Return last 32 bytes
     """
+    if verbose:
+        print(colored(f"               [*] Starting CNG-key extraction from: {dirpath}",))
+
+    # Check if directory exists
+    if not os.path.exists(dirpath):
+        print(colored(f"               [!] Directory does not exist: {dirpath}", "red"))
+        return None
+
+    if not os.path.isdir(dirpath):
+        print(colored(f"               [!] Path is not a directory: {dirpath}", "red"))
+        return None
+
+    search_utf16 = "Google Chromekey1".encode("utf-16le")
+    private_key_utf16 = "Private Key".encode("utf-16le")
+
+    dpapi_marker = bytes.fromhex(
+        "01 00 00 00 D0 8C 9D DF 01 15 D1 11 8C 7A 00 C0"
+    )
+
+    candidate_file = None
+    file_bytes = None
+
+    # Find candidate file
+    try:
+        files = os.listdir(dirpath)
+        if verbose:
+            print(colored(f"               [*] Scanning {len(files)} items in directory",))
+    except Exception as e:
+        print(colored(f"[-] Error listing directory: {e}", "red"))
+        return None
+
+    for name in files:
+        path = os.path.join(dirpath, name)
+        if not os.path.isfile(path):
+            continue
+
+        try:
+            with open(path, "rb") as f:
+                buf = f.read()
+
+            if search_utf16 in buf:
+                candidate_file = path
+                file_bytes = buf
+                print(colored(f"               [+] Found \"Google Chromekey1\" in: {path}", "green"))
+                break
+        except Exception as e:
+            if verbose:
+                print(colored(f"[-] Error reading file {name}: {e}", "red"))
+            continue
+
+    if not candidate_file:
+        print(colored("               [!] No file containing 'Google Chromekey1' found", "red"))
+        return None
+
+    # Extract DPAPI blocks
+    offsets = []
+    pos = 0
+    while True:
+        try:
+            idx = file_bytes.index(dpapi_marker, pos)
+            offsets.append(idx)
+            if verbose:
+                print(colored(f"               [*] Found DPAPI marker at offset: {idx}",))
+            pos = idx + 1
+        except ValueError:
+            break
+
+    if len(offsets) < 2:
+        print(colored(f"               [-] Need at least 2 DPAPI blocks, found: {len(offsets)}", "red"))
+        return None
+
+    second_block = file_bytes[offsets[1]:]
+
+    if private_key_utf16 not in second_block:
+        print(colored("               [-] 'Private Key' string not found in second DPAPI block", "red"))
+        return None
+
+    if verbose:
+        print(colored("               [+] Found 'Private Key' in second block", "green"))
+
+    # Parse DPAPI blob
+    try:
+        dpapi_blob = blob.DPAPIBlob(second_block)
+    except Exception as e:
+        print(colored(f"               [-] Error parsing DPAPI blob: {e}", "red"))
+        return None
+
+    # Load SystemMasterkeys
+    mkp = masterkey.MasterKeyPool()
+    system_masterkey_path = None
+    if hasattr(args, 'systemmasterkey') and args.systemmasterkey:
+        system_masterkey_path = args.systemmasterkey
+    elif hasattr(args, 'y') and args.y:
+        system_masterkey_path = args.y
+    elif hasattr(args, 'system_mkfile') and args.system_mkfile:
+        system_masterkey_path = args.system_mkfile
+    else:
+        print(colored("[-] No system master key directory specified (need --systemmasterkey or -y)", "red"))
+        return None
+
+    try:
+        mkp.loadDirectory(system_masterkey_path)
+        if verbose:
+            print(colored(f"               [*] Loaded SystemMasterkeys from: {system_masterkey_path}",))
+    except Exception as e:
+        print(colored(f"               [-] Error loading system master keys: {e}", "red"))
+        return None
+
+    # Load system credentials for decrypting system master keys
+    try:
+        reg = registry.Regedit()
+        secrets = reg.get_lsa_secrets(args.security, args.system)
+        mkp.addSystemCredential(secrets["DPAPI_SYSTEM"]["CurrVal"])
+        mkp.try_credential_hash(None, None)
+
+    except Exception as e:
+        print(colored(f"               [-] Error loading SystemMasterkeys: {e}", "red"))
+        return None
+
+    print(colored(f"               [+] CNG-blob references following SystemMasterKey GUID: {dpapi_blob.mkguid}",))
+
+    # Get master keys using the GUID
+    master_keys = mkp.getMasterKeys(dpapi_blob.mkguid.encode())
+
+    if not master_keys:
+        print(colored(f"[-] No master keys found for GUID: {dpapi_blob.mkguid}", "red"))
+        if verbose:
+            print(colored(f"[*] Available system master key GUIDs:", "cyan"))
+            for guid in mkp.keys.keys():
+                print(colored(f"    - {guid}", "cyan"))
+        return None
+
+    if verbose:
+        print(colored(f"               [*] Found {len(master_keys)} SystemMasterkey(s) for this GUID",))
+
+    entropy = b"xT5rZW5qVVbrvpuA\x00"
+
+    # Try to decrypt with the matched master keys
+    for mk in master_keys:
+        if not mk.decrypted:
+            if verbose:
+                print(colored(f"[*] SystemMasterkey not decrypted, skipping", "yellow"))
+            continue
+
+        if verbose:
+            print(colored(f"               [*] Trying to decrypt DPAPI blob with SystemMasterkey",))
+
+        dpapi_blob.decrypt(mk.get_key(), entropy)
+
+        if dpapi_blob.decrypted:
+            clear = dpapi_blob.cleartext
+            if verbose:
+                print(colored(f"               [+] Successfully decrypted DPAPI-blob ({len(clear)} bytes)",))
+                print(hexdump(clear))
+
+            if clear.startswith(b"KDBM"):
+                key = clear[-32:]
+                print(colored("               [+] Extracted CNG-key (32 bytes):", "green"))
+                print(hexdump(key))
+
+                return key
+            else:
+                print(colored(f"               [-] Warning! Decrypted blob does not start with KDBM-header: {clear[:4].hex()}", "red"))
+                if verbose:
+                    print(hexdump(clear[:64]))
+
+    print(colored(f"[-] Unable to decrypt DPAPI blob with available SystemMasterkeys", "red"))
+    return None
+
+
+def decrypt_abe_stage3_with_static_keys(abe_encrypted_key, args, verbose=False):
+    """
+    Stage 3: Decrypt app_bound_encrypted_key.
+    """
+    if verbose:
+        # print(colored('    [+] Stage 3 - Checking for CNG ChromeKey1 path', ))
+        print(colored('    [+] Stage 3 - Decrypt app_bound_encrypted_key', "cyan"))
+
     try:
         # Parse header
         header_len = struct.unpack('<I', abe_encrypted_key[:4])[0]
@@ -364,7 +549,7 @@ def decrypt_abe_stage3_with_static_keys(abe_encrypted_key, verbose=False):
         header = abe_encrypted_key[4:header_end].strip(b'\x02').decode(errors='ignore')
 
         if verbose:
-            print(colored(f'    [+] Stage 3 - Found header: "{header}"', ))
+            print(colored(f'         [+] Found header in encrypted_ABE-key: "{header}"', ))
 
         # Parse content
         content_len = struct.unpack('<I', abe_encrypted_key[header_end:header_end + 4])[0]
@@ -373,7 +558,7 @@ def decrypt_abe_stage3_with_static_keys(abe_encrypted_key, verbose=False):
 
         # Handle unversioned format (some Edge versions)
         if content_len == 32:
-            if verbose: print(colored('    [+] Stage 3 - Version flag not found, using raw key', ))
+            if verbose: print(colored('         [+] Version flag not found, using raw key', "red"))
             return content
 
         # Determine version and decrypt
@@ -382,7 +567,7 @@ def decrypt_abe_stage3_with_static_keys(abe_encrypted_key, verbose=False):
         decrypted_key = None
 
         if verbose:
-            print(colored(f'    [+] Stage 3 - Detected ABE_key version: {version}', ))
+            print(colored(f'         [+] Detected ABE_key version: {version}', ))
 
         if version in (1, 2):
             # Format: IV(12) | Ciphertext(32) | Tag(16)
@@ -401,8 +586,50 @@ def decrypt_abe_stage3_with_static_keys(abe_encrypted_key, verbose=False):
 
 
         elif version == 3:
-            print(colored('    [!] Stage 3 - ABE_key version 3 is not supported. Exiting.', 'red'))
-            sys.exit(1)
+            if verbose:
+                print('         [+] Using extra CNG-key for version 3 decryption')
+
+            # Check if CNG directory argument is provided
+            if not hasattr(args, 'cng') or not args.cng:
+                print(colored('    [!] Stage 3 - No CNG-directory specified (use --cng argument)', 'red'))
+                return None
+
+            cng_key = extract_cng_key_from_directory(args.cng, args, verbose)
+
+            if not cng_key:
+                if verbose:
+                    print(colored('    [!] Stage 3 - Failed to extract CNG-key', 'red'))
+                return None
+
+            if len(cng_key) != 32:
+                print(colored(f'    [-] Stage 3 - Invalid CNG key length: {len(cng_key)} (expected 32)', 'red'))
+                return None
+
+            # Format: EncAES(32) | IV(12) | Ciphertext(32) | Tag(16)
+            encrypted_aes_key = data[:32]
+            iv = data[32:44]
+            ciphertext = data[44:76]
+            tag = data[76:92]
+
+            # Step 1: Decrypt the AES key using CNG-key with AES-CBC
+            cipher_cbc = AES.new(cng_key, AES.MODE_CBC, iv=b"\x00" * 16)
+            decrypted_aes_key = cipher_cbc.decrypt(encrypted_aes_key)
+
+            if verbose:
+                print("               [+] Decrypted encrypted_ABE_key:")
+                print(hexdump(decrypted_aes_key))
+
+            # Step 2: XOR with static key
+            xor_key = bytes.fromhex("CCF8A1CEC56605B8517552BA1A2D061C03A29E90274FB2FCF59BA4B75C392390")
+            xored_aes_key = bytes(a ^ b for a, b in zip(decrypted_aes_key, xor_key))
+
+            if verbose:
+                print("               [+] Applying XOR:")
+                print(hexdump(xored_aes_key))
+
+            # Step 3: Use the derived key to decrypt the final ciphertext with AES-GCM
+            cipher_gcm = AES.new(xored_aes_key, AES.MODE_GCM, nonce=iv)
+            decrypted_key = cipher_gcm.decrypt_and_verify(ciphertext, tag)
 
         else:
             if verbose:
@@ -413,7 +640,7 @@ def decrypt_abe_stage3_with_static_keys(abe_encrypted_key, verbose=False):
 
         # final print and return
         if verbose:
-                print(colored(f'    [+] Stage 3 - Decrypted ABE_key: \n{hexdump(decrypted_key)}', ))
+                print(colored(f'               [+] Final decrypted ABE_key: \n{hexdump(decrypted_key)}', ))
         return decrypted_key
 
     except Exception as e:
@@ -424,7 +651,7 @@ def decrypt_abe_stage3_with_static_keys(abe_encrypted_key, verbose=False):
 
 
 def decrypt_app_bound_encryption_key(abe_system_blob, system_hive, security_hive,
-                                     system_mk_folder, user_masterkeys, verbose=False):
+                                     system_mk_folder, user_masterkeys, args, verbose=False):
     """
     Complete 3-stage App-Bound Encryption key decryption process.
     """
@@ -451,16 +678,14 @@ def decrypt_app_bound_encryption_key(abe_system_blob, system_hive, security_hive
         return None
 
     # Stage 3: Decrypt with static keys
-    abe_key = decrypt_abe_stage3_with_static_keys(abe_encrypted_key, verbose)
+    abe_key = decrypt_abe_stage3_with_static_keys(abe_encrypted_key, args, verbose)
 
     return abe_key
-
 
 
 # ============================================================================
 # OUTPUT
 # ============================================================================
-
 def decrypt_and_display_logins(logins, bme_key, abe_key, masterkeys, csvfile=None, verbose=False):
     """Decrypt and display login credentials."""
     print(colored('\n[INFO] Decrypting logins...', 'yellow'))
@@ -555,6 +780,8 @@ def setup_argument_parser():
     parser.add_argument('-u', '--security', help='SECURITY registry hive')
     parser.add_argument('-o', '--export', help='Export to CSV filename')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output')
+    parser.add_argument('--cng', help='Directory to scan for Chrome CNG key blobs')
+
     return parser
 
 
@@ -589,6 +816,7 @@ def display_usage_information():
     print(f"  UserMasterkeys:   %appdata%\\Roaming\\Microsoft\\Protect\\S-1-5-21...-folder")
     print(f"  SystemMasterkeys: %Windows%\\System32\\Microsoft\\Protect\\S-1-5-18\\User-folder")
     print(f"  Cachedata:        %Windows%\\System32\\config\\systemprofile\\AppData\\local\\microsoft\\windows\\CloudAPCache\\MicrosoftAccount\\Cachedata")
+    print(f"  CNG:              %ProgramData%\\Microsoft\\Crypto\\SystemKeys-folder")
 
 
 def prepare_arguments(args):
@@ -727,13 +955,14 @@ def main():
             args.security,
             args.systemmasterkey,
             masterkeys,
+            args,
             args.verbose
         )
 
         if abe_key:
-            print(colored(f'[+] Successfully extracted App_Bound_Encryption-key', 'green'))
+            print(colored(f'               [+] Successfully extracted App_Bound_Encryption-key', 'green'))
         else:
-            print(colored('    [-] Failed to decrypt App_Bound_Encryption-key', 'yellow'))
+            print(colored('    [!] Failed to decrypt App_Bound_Encryption-key', 'red'))
 
     # ========================================================================
     # PHASE 6: Decrypt and Export Credentials
